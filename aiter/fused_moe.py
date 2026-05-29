@@ -20,7 +20,6 @@ from aiter.jit.core import (
     AITER_CSRC_DIR,
     PY,
     bd_dir,
-    get_asm_dir,
     mp_lock,
 )
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
@@ -41,7 +40,7 @@ BLOCK_SIZE_M = 32
 # The 1-stage kernel fuses both GEMMs + SiLU into a single dispatch, saving
 # one round-trip to HBM3e for the intermediate activations.
 # ---------------------------------------------------------------------------
-_1STAGE_TOKEN_THRESHOLD = 512   # tokens (after padding)
+_1STAGE_TOKEN_THRESHOLD = 512  # tokens (after padding)
 
 # ---------------------------------------------------------------------------
 # Module-level GFX / CU-count cache.
@@ -85,12 +84,12 @@ _GFX950_BLOCKSCALE_NOVS_KERNELS = {
 # names.  On all other GPUs they resolve to "" (safe fallback: let ASM
 # select internally).  Resolved once at import time.
 # ---------------------------------------------------------------------------
-_FAST_PATH_KERNELNAME_BF16: str = (
-    _GFX950_BLOCKSCALE_NOVS_KERNELS.get((_cached_gfx, dtypes.bf16), ("", ""))[1]
-)
-_FAST_PATH_KERNELNAME_FP16: str = (
-    _GFX950_BLOCKSCALE_NOVS_KERNELS.get((_cached_gfx, dtypes.fp16), ("", ""))[1]
-)
+_FAST_PATH_KERNELNAME_BF16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
+    (_cached_gfx, dtypes.bf16), ("", "")
+)[1]
+_FAST_PATH_KERNELNAME_FP16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
+    (_cached_gfx, dtypes.fp16), ("", "")
+)[1]
 
 # ---------------------------------------------------------------------------
 # Scale-transpose buffer cache.
