@@ -7,14 +7,22 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import aiter
 import torch
+
+import aiter
 
 # from aiter import get_torch_quant as get_quant
 from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
-from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
+from aiter.jit.core import (
+    AITER_CONFIGS,
+    AITER_CSRC_DIR,
+    PY,
+    bd_dir,
+    get_asm_dir,
+    mp_lock,
+)
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -26,6 +34,86 @@ from aiter import (
 )
 
 BLOCK_SIZE_M = 32
+
+# ---------------------------------------------------------------------------
+# Threshold below which the 1-stage ASM FP8-blockscale kernel is preferred
+# over the 2-stage CK path for gfx950 decode workloads.
+# The 1-stage kernel fuses both GEMMs + SiLU into a single dispatch, saving
+# one round-trip to HBM3e for the intermediate activations.
+# ---------------------------------------------------------------------------
+_1STAGE_TOKEN_THRESHOLD = 512   # tokens (after padding)
+
+# ---------------------------------------------------------------------------
+# Module-level GFX / CU-count cache.
+#
+# get_gfx() and get_cu_num() both call into the HIP runtime to query the
+# device.  Caching them at module-import time eliminates all runtime
+# overhead on the decode hot path.  GFX string and CU count are hardware
+# constants that cannot change within a process lifetime, so a module-level
+# singleton is correct.
+# ---------------------------------------------------------------------------
+_cached_gfx: str = get_gfx()
+_cached_cu_num: int = get_cu_num()
+
+# ---------------------------------------------------------------------------
+# Per-GFX kernel-name table for the 1-stage fused FP8-blockscale g1u1 kernel.
+#
+# When the force-1stage override fires (doweight_stage1=False, gfx950,
+# per_1x128 FP8) we pass the exact mangled C++ kernel name so the ASM
+# dispatch layer skips its internal selection loop and loads the correct
+# .co binary directly.
+#
+# novs    = no-vskip: applies sorted_weights inside kernel (doweight_stage1=False)
+# novs_ps = same but with pre-sorted weight layout from moe_sorting (better L2)
+# ---------------------------------------------------------------------------
+_GFX950_BLOCKSCALE_NOVS_KERNELS = {
+    # (gfx, output_dtype) -> (plain_novs_name, presorted_novs_ps_name)
+    ("gfx950", dtypes.bf16): (
+        "_ZN5aiter49fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256E",
+        "_ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E",
+    ),
+    ("gfx950", dtypes.fp16): (
+        "_ZN5aiter49fmoe_fp16_blockscaleFp8_g1u1_novs_silu_1tg_32x256E",
+        "_ZN5aiter52fmoe_fp16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E",
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Pre-resolved fast-path kernel names for the current GPU.
+#
+# On gfx950 these resolve to the full mangled presorted-ps novs kernel
+# names.  On all other GPUs they resolve to "" (safe fallback: let ASM
+# select internally).  Resolved once at import time.
+# ---------------------------------------------------------------------------
+_FAST_PATH_KERNELNAME_BF16: str = (
+    _GFX950_BLOCKSCALE_NOVS_KERNELS.get((_cached_gfx, dtypes.bf16), ("", ""))[1]
+)
+_FAST_PATH_KERNELNAME_FP16: str = (
+    _GFX950_BLOCKSCALE_NOVS_KERNELS.get((_cached_gfx, dtypes.fp16), ("", ""))[1]
+)
+
+# ---------------------------------------------------------------------------
+# Scale-transpose buffer cache.
+#
+# For LLM decode the same (M, model_dim) shape repeats on every token step.
+# Allocating a new transposed scale buffer on every fused_moe_1stage call
+# causes a stream of small HIP mallocs that compound at high token-step
+# throughput.  We keep one buffer per (device, shape, dtype) and reuse it.
+# ---------------------------------------------------------------------------
+_scale_t_cache: dict = {}
+
+
+def _get_scale_t_buf(scale: torch.Tensor) -> torch.Tensor:
+    """Return a [cols, rows] buffer for transpose of scale [rows, cols],
+    reusing a cached allocation when shape/dtype/device match."""
+    rows, cols = scale.shape
+    key = (scale.device.index, cols, rows, scale.dtype)
+    buf = _scale_t_cache.get(key)
+    if buf is None:
+        buf = torch.empty((cols, rows), dtype=scale.dtype, device=scale.device)
+        _scale_t_cache[key] = buf
+    return buf
+
 
 # Default to Opus unless CK sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
@@ -365,7 +453,7 @@ def fused_moe_(
         if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
+            if _cached_gfx != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = dtypes.fp8
@@ -407,8 +495,8 @@ def fused_moe_(
         and expert_mask is not None
     )
     assert (
-        not metadata.flat or get_gfx() == "gfx950"
-    ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
+        not metadata.flat or _cached_gfx == "gfx950"
+    ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {_cached_gfx}. "
     sorting_ret = moe_sorting(
         topk_ids,
         topk_weight,
@@ -585,7 +673,7 @@ def fused_moe_1stage(
                 ), "a1_scale must be provided for quantized input for fused_moe"
                 a1 = hidden_states
                 if quant_type == QuantType.per_1x128:
-                    scale_t = torch.empty_like(a1_scale)
+                    scale_t = _get_scale_t_buf(a1_scale)
                     aiter.partial_transpose(
                         scale_t, a1_scale, num_rows=num_local_tokens
                     )
@@ -654,7 +742,7 @@ def fused_moe_1stage(
 
 @functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
@@ -685,7 +773,7 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     # only for moe_blk gemm1 a8w8 decode scenario
     if token * topk > expert:
         return 0
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     tileN = 128
 
     tgM = token * topk  # decode tile num
@@ -1016,7 +1104,7 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     bias_key = bool(bias)
     keys = (
         cu_num,
@@ -1159,7 +1247,7 @@ def get_2stage_cfgs(
             q_dtype_w,
             use_g1u1,
             doweight_stage1,
-        ) in fused_moe_1stage_dict[get_gfx()]:
+        ) in fused_moe_1stage_dict[_cached_gfx]:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 128 == 0)
@@ -1170,8 +1258,21 @@ def get_2stage_cfgs(
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
-            if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
+            if run_1stage and q_type == QuantType.per_1x128 and _cached_gfx == "gfx950":
                 run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
+                # Force-1stage fast path: when doweight_stage1 is False and the
+                # padded token count is below the gfx950 threshold, pre-resolve
+                # the mangled novs_ps kernel name so the ASM dispatch layer
+                # skips its internal selection loop.
+                if (
+                    not doweight_stage1
+                    and token < _1STAGE_TOKEN_THRESHOLD
+                    and not kernelName1
+                ):
+                    if dtype == dtypes.bf16:
+                        kernelName1 = _FAST_PATH_KERNELNAME_BF16
+                    elif dtype == dtypes.fp16:
+                        kernelName1 = _FAST_PATH_KERNELNAME_FP16
 
         block_m = (
             BLOCK_SIZE_M
@@ -2513,7 +2614,7 @@ def fused_topk(
     )
 
     if (
-        get_gfx() in ["gfx942", "gfx950"]
+        _cached_gfx in ["gfx942", "gfx950"]
         and (expert, topk)
         in [
             (128, 4),
